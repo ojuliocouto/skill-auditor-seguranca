@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Varredura de seguranca do projeto: segredos, .env, dados pessoais em log, service_role.
+"""Varredura de seguranca do projeto: segredos, .env, dados pessoais em log, service_role,
+webhook sem assinatura, segredo em variavel publica, senha sem hash, SQL concatenado,
+HTML inseguro, API sem rate limit e dependencias vulneraveis (npm audit).
 
 Gate executavel: sai com codigo 2 se houver CRITICO, 1 se houver ALTO, 0 se limpo.
 Read-only: nao altera nenhum arquivo do projeto.
@@ -11,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -49,6 +52,86 @@ PADRAO_DADO_PESSOAL = re.compile(
 PADRAO_CPF_LITERAL = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")
 PADRAO_CORS = re.compile(r"""(?i)(?:access-control-allow-origin["'\s:]+\*|origin\s*:\s*["']\*["'])""")
 
+# Regras de codigo so olham arquivo de codigo (README que cita "nunca use innerHTML" nao e achado)
+EXT_CODIGO = {"js", "jsx", "ts", "tsx", "mjs", "cjs", "vue", "svelte", "astro", "html",
+              "py", "php", "rb", "go"}
+
+# Variavel com prefixo que o bundler copia pro navegador: o nome diz que e segredo
+PADRAO_VAR_PUBLICA = re.compile(r"\b((?:NEXT_PUBLIC|VITE|REACT_APP|EXPO_PUBLIC|NUXT_PUBLIC|GATSBY|PUBLIC)_[A-Z0-9_]+)")
+NOME_DE_SEGREDO = re.compile(r"SECRET|SERVICE_ROLE|PRIVATE|PASSWORD|SENHA|TOKEN|OPENAI|ANTHROPIC|GROQ|CLAUDE|GEMINI|WEBHOOK")
+NOME_PUBLICO_OK = re.compile(r"ANON|PUBLISHABLE|SITE_KEY|PUBLIC_KEY")
+
+# Rota de webhook e sinais de que a assinatura e conferida
+PADRAO_ROTA_WEBHOOK = re.compile(
+    r"""(?i)(?:\.(?:post|all|use|route|on)\s*\(\s*["'`][^"'`]*webhook"""
+    r"""|@\w+\.(?:post|route|api_route)\(\s*["'][^"']*webhook"""
+    r"""|pathname\s*={2,3}\s*["'`][^"'`]*webhook)""")
+SINAL_ASSINATURA = re.compile(
+    r"(?i)constructEvent|signature|assinatura|hmac|verify|hottok|webhook_?secret|segredo|timingSafeEqual|validateWebhook|svix")
+
+# Senha vinda do request gravada direto, e sinais de hash no arquivo
+PADRAO_SENHA_CRUA = re.compile(
+    r"""(?i)\b(?:password|senha|passwd)["']?\s*[:=]\s*(?:req\.body|request\.(?:form|json|body|data)|body|input|payload|form|args)\s*(?:\.|\[)""")
+SINAL_HASH = re.compile(r"(?i)bcrypt|argon2|scrypt|pbkdf2|hashpw|make_password|password_hash|createHash|crypto\.subtle")
+
+# SQL montado com dado: template sem tag, concatenacao, f-string, % e .format
+SQL_KW = r"(?:\bselect\b[^`'\"]*\bfrom\b|\binsert\s+into\b|\bupdate\s+\w+\s+set\b|\bdelete\s+from\b)"
+PADRAO_SQL_TEMPLATE = re.compile(r"(\w*)`([^`]*)`")
+PADRAO_FSTRING = re.compile(r"""\b[fF](["'])(.*?)(?<!\\)\1""")
+PADRAO_SQL_OUTROS = re.compile(
+    rf"""(?i)(?:["']{SQL_KW}[^"']*["']\s*\+"""
+    rf"""|["']{SQL_KW}[^"']*%s[^"']*["']\s*%"""
+    rf"""|["']{SQL_KW}[^"']*\{{\}}[^"']*["']\.format\()""")
+# Placeholder no SQL = os valores vao separados; o que se interpola costuma ser nome de tabela/lista de ?
+PLACEHOLDER_SQL = re.compile(r"\?|\$\d+|(?<![:\w]):[A-Za-z_]\w*|%s|%\(\w+\)s")
+DADO_DO_REQUEST = re.compile(r"(?i)\breq\b|request|body|params|query|input|form|payload|args")
+# Codigo de teste roda com valor controlado pelo proprio teste: fica fora de SQL e HTML
+PADRAO_ARQUIVO_TESTE = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)/|\.(?:test|spec)\.\w+$|(?:^|/)test_\w+\.py$")
+LINHA_MINIFICADA = 400  # linha maior que isso e bundle gerado, nao codigo escrito
+
+EXPR_SEGURA = re.compile(r"""^\s*(?:[A-Z][A-Z0-9_]*|(?:Number|parseInt|parseFloat|int|float)\(.*\))\s*$""")
+
+def sql_interpolado_inseguro(corpo, exprs, tem_params=False):
+    """Interpolacao em SQL so e achado se nao ha placeholder (valor vai junto do comando)
+    ou se o que entra vem do request. Constante em MAIUSCULA (nome de tabela) e numero
+    convertido (Number(id)) nao carregam comando."""
+    sem_exprs = re.sub(r"\$?\{[^}]*\}", "", corpo)  # SQL dentro da expressao nao conta
+    if not exprs or not re.search(SQL_KW, sem_exprs, re.I):
+        return False
+    if any(DADO_DO_REQUEST.search(e) for e in exprs):
+        return True
+    arriscadas = [e for e in exprs if not EXPR_SEGURA.match(e)]
+    if not arriscadas:
+        return False
+    # placeholder no texto ou gerado na expressao (ids.map(() => "?"), ", ".join("?" ...))
+    return not (tem_params or PLACEHOLDER_SQL.search(sem_exprs) or any("?" in e or "$" in e for e in exprs))
+
+# Depois da string vem argumento (, params) ou .bind(...): os valores vao separados
+PARAMS_DEPOIS = re.compile(r"^\s*(?:,|\)\s*\.bind\s*\()")
+
+def sql_inseguro(ln):
+    for m in PADRAO_SQL_TEMPLATE.finditer(ln):
+        exprs = re.findall(r"\$\{([^}]*)\}", m.group(2))
+        if not m.group(1) and sql_interpolado_inseguro(m.group(2), exprs, PARAMS_DEPOIS.match(ln[m.end():])):
+            return True
+    for m in PADRAO_FSTRING.finditer(ln):
+        exprs = re.findall(r"\{([^}]*)\}", m.group(2))
+        if sql_interpolado_inseguro(m.group(2), exprs, PARAMS_DEPOIS.match(ln[m.end():])):
+            return True
+    return bool(PADRAO_SQL_OUTROS.search(ln))
+
+# HTML montado com dado (XSS)
+PADRAO_HTML_DIRETO = re.compile(r"dangerouslySetInnerHTML|\bv-html\s*=|\{@html\s|insertAdjacentHTML\s*\(|document\.write\s*\(")
+PADRAO_INNERHTML = re.compile(r"\.(?:inner|outer)HTML\s*\+?=\s*(.+)$")
+LITERAL_PURO = re.compile(r"""^(?:(["'])[^"'`]*\1|`[^`$]*`)\s*;?\s*$""")
+SINAL_SANITIZA = re.compile(r"(?i)DOMPurify|sanitize|escapeHtml|escapar")
+
+# Servidor com rota propria, e sinais de rate limit no projeto
+PADRAO_ROTA_SERVIDOR = re.compile(
+    r"""(?i)\b(?:app|router|server|fastify)\.(?:get|post|put|patch|delete|all)\s*\(|@app\.(?:route|get|post)\b"""
+    r"""|\bnew\s+Hono\b|export\s+default\s*\{\s*(?:async\s+)?fetch|Deno\.serve\s*\(""")
+SINAL_RATE_LIMIT = re.compile(r"(?i)rate.?limit|limiter|throttl|slowapi")
+
 def mascara(v):
     return v[:6] + "..." + v[-3:] if len(v) > 12 else v[:3] + "..."
 
@@ -77,6 +160,35 @@ def git(raiz, *args):
         return r.stdout if r.returncode == 0 else None
     except Exception:
         return None
+
+def auditar_dependencias(raiz, add):
+    """Roda npm audit quando ha package.json na raiz. Sem lockfile, sem npm ou sem rede vira
+    VERIFICAR: dependencia nao auditada nunca passa como aprovada."""
+    if not os.path.exists(os.path.join(raiz, "package.json")):
+        return
+    def nao_auditada(motivo):
+        add("DEPENDENCIA_NAO_AUDITADA", "VERIFICAR", "package.json", 0,
+            f"as dependencias NAO foram auditadas: {motivo}",
+            "rodar npm audit na maquina com npm e internet, ou gerar o package-lock.json (npm install)")
+    if not os.path.exists(os.path.join(raiz, "package-lock.json")):
+        return nao_auditada("o projeto nao tem package-lock.json (npm audit precisa dele)")
+    npm = shutil.which("npm")
+    if not npm:
+        return nao_auditada("npm nao esta instalado neste computador")
+    try:
+        r = subprocess.run([npm, "audit", "--json"], cwd=raiz, capture_output=True, text=True, timeout=120)
+        vul = json.loads(r.stdout)["metadata"]["vulnerabilities"]
+    except Exception as e:
+        return nao_auditada(f"npm audit falhou ({type(e).__name__}); sem internet o npm nao consulta a base")
+    crit, alta, mod = vul.get("critical", 0), vul.get("high", 0), vul.get("moderate", 0)
+    if crit or alta:
+        add("DEPENDENCIA_VULNERAVEL", "ALTO", "package-lock.json", 0,
+            f"npm audit: {crit} critica(s), {alta} alta(s), {mod} moderada(s) em pacotes do projeto",
+            "rodar npm audit fix (e npm audit para ver o que sobra); atualizar o pacote ou trocar por outro mantido")
+    elif mod:
+        add("DEPENDENCIA_VULNERAVEL", "MEDIO", "package-lock.json", 0,
+            f"npm audit: {mod} vulnerabilidade(s) moderada(s)",
+            "rodar npm audit fix quando der")
 
 def varrer(raiz):
     achados = []
@@ -121,6 +233,7 @@ def varrer(raiz):
         if eh_arquivo_de_exemplo(rel):
             continue
         eh_env = os.path.basename(rel).startswith(".env")
+        eh_teste = bool(PADRAO_ARQUIVO_TESTE.search(rel.replace(os.sep, "/")))
         try:
             linhas = open(caminho, encoding="utf-8", errors="replace").read().splitlines()
         except OSError:
@@ -156,6 +269,70 @@ def varrer(raiz):
                 add("CORS_ABERTO", "MEDIO", rel, i,
                     "CORS liberado para qualquer origem (*)",
                     "restringir ao dominio real do frontend")
+            ext = rel.split(".")[-1].lower()
+            if eh_env or ext in EXT_CODIGO:
+                for nome_var in PADRAO_VAR_PUBLICA.findall(ln):
+                    if NOME_DE_SEGREDO.search(nome_var) and not NOME_PUBLICO_OK.search(nome_var):
+                        add("SEGREDO_EM_VAR_PUBLICA", "CRITICO", rel, i,
+                            f"{nome_var}: variavel com esse prefixo vai pro codigo do navegador, qualquer visitante le o valor",
+                            "tirar o prefixo publico, usar a chave so no backend (API route, edge function) e TROCAR a chave")
+                        break
+            if ext not in EXT_CODIGO or len(ln) > LINHA_MINIFICADA:
+                continue
+            if not eh_teste and sql_inseguro(ln):
+                add("SQL_CONCATENADO", "ALTO", rel, i,
+                    "SQL montado com dado dentro da string (interpolacao, concatenacao ou formatacao): dado do usuario vira comando no banco (SQL injection)",
+                    "usar query parametrizada ($1, ?, :nome) ou o query builder/ORM; nome de tabela interpolado so de lista fixa")
+            if not eh_teste and not SINAL_SANITIZA.search(ln):
+                m = PADRAO_INNERHTML.search(ln)
+                if PADRAO_HTML_DIRETO.search(ln) or (m and not LITERAL_PURO.match(m.group(1).strip())):
+                    add("HTML_INSEGURO", "MEDIO", rel, i,
+                        "HTML montado com dado e injetado na pagina: se o dado vier do usuario, abre XSS",
+                        "usar textContent / renderizacao normal do framework, ou sanitizar com DOMPurify antes")
+
+    # 2b) regras que olham o arquivo inteiro: webhook e senha
+    arquivos_rota, tem_rate_limit = [], False
+    for caminho in arquivos_do_projeto(raiz):
+        rel = os.path.relpath(caminho, raiz)
+        ext = rel.split(".")[-1].lower()
+        if os.path.basename(rel) == "package.json":
+            try:
+                if SINAL_RATE_LIMIT.search(open(caminho, encoding="utf-8", errors="replace").read()):
+                    tem_rate_limit = True
+            except OSError:
+                pass
+        if ext not in EXT_CODIGO or eh_arquivo_de_exemplo(rel):
+            continue
+        try:
+            corpo = open(caminho, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        linhas = corpo.splitlines()
+        if SINAL_RATE_LIMIT.search(corpo):
+            tem_rate_limit = True
+        if PADRAO_ROTA_SERVIDOR.search(corpo):
+            arquivos_rota.append(rel)
+        # sinais contam so no codigo: "// TODO verificar assinatura" nao protege nada
+        so_codigo = re.sub(r"(?m)^\s*(?://|#|/?\*).*$", "", corpo)
+        if not SINAL_ASSINATURA.search(so_codigo):
+            for i, ln in enumerate(linhas, 1):
+                if PADRAO_ROTA_WEBHOOK.search(ln):
+                    add("WEBHOOK_SEM_ASSINATURA", "ALTO", rel, i,
+                        "rota de webhook que nao confere assinatura/segredo: qualquer um que achar a URL manda um POST falso e libera plano sem pagar",
+                        "validar a assinatura com a SDK oficial (Stripe constructEvent, hottok da Hotmart, HMAC do gateway) ANTES de ler o corpo; sem assinatura valida, responder 400/401")
+        if not SINAL_HASH.search(so_codigo):
+            for i, ln in enumerate(linhas, 1):
+                if PADRAO_SENHA_CRUA.search(ln):
+                    add("SENHA_SEM_HASH", "ALTO", rel, i,
+                        "senha vinda do request gravada sem hash: quem ler o banco (ou um backup vazado) ve a senha do usuario",
+                        "gravar so o hash (bcrypt ou argon2) e comparar com bcrypt.compare no login")
+    if arquivos_rota and not tem_rate_limit:
+        add("SEM_RATE_LIMIT", "MEDIO", sorted(arquivos_rota)[0], 0,
+            f"o projeto tem rotas de servidor ({len(arquivos_rota)} arquivo(s)) e nenhum sinal de rate limit: login e API ficam abertos a forca bruta e enxurrada de requisicoes",
+            "limitar requisicoes por IP/usuario (express-rate-limit, @upstash/ratelimit, slowapi) ou regra de rate limit no WAF/Cloudflare; se ja existe no WAF, registre e ignore")
+
+    # 2c) dependencias com vulnerabilidade conhecida (npm audit)
+    auditar_dependencias(raiz, add)
 
     # 3) heuristica de admin sem protecao
     for caminho in arquivos_do_projeto(raiz):

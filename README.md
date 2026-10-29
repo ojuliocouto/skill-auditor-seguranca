@@ -80,12 +80,12 @@ tests/                       proof the gate works both ways (see Security note)
 
 `tests/fixture-vulneravel/` contains **planted, fake, non-functional secrets** (realistic format,
 invented content). They exist so the test suite can prove the gate goes red when it must:
-`tests/test_varredura.py` asserts 8 specific findings on the vulnerable fixture and zero on the
+`tests/test_varredura.py` asserts 15 specific findings on the vulnerable fixture and zero on the
 clean one. None of those strings is or ever was a real credential. If your secret scanner flags
 this directory, that is the fixture doing its job.
 
 ```bash
-python3 tests/test_varredura.py   # expected: 10/10
+python3 tests/test_varredura.py   # expected: 22/22 (npm audit runs against a stub in tests/duble-npm, no network)
 ```
 
 ## Sources
@@ -96,4 +96,4 @@ NIST SP 800-218A and Lei 13.709/2018 (LGPD).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT: see [LICENSE](LICENSE).

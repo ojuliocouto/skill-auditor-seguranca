@@ -1,6 +1,6 @@
 ---
 name: auditor-seguranca
-description: "Auditor de segurança e LGPD para projetos construídos com IA. Varre o projeto e reporta o que está exposto (segredos no código, .env vazando, service_role no frontend, RLS ausente no Supabase, dados pessoais em log, admin sem proteção), explica cada achado em linguagem de gente e conduz a correção até o gate ficar verde. Também checa o site já publicado."
+description: "Auditor de segurança e LGPD para projetos construídos com IA. Varre o projeto e reporta o que está exposto (segredos no código, .env vazando, service_role no frontend, RLS ausente no Supabase, dados pessoais em log, admin sem proteção, webhook de pagamento sem assinatura, segredo em NEXT_PUBLIC/VITE, senha sem hash, SQL injection, HTML inseguro, API sem rate limit, dependência vulnerável), explica cada achado em linguagem de gente e conduz a correção até o gate ficar verde. Também checa o site já publicado."
 allowed-tools: Bash, Read, Edit, Write, Grep, Glob
 triggers:
   - /auditar-seguranca
@@ -60,6 +60,24 @@ python3 ~/.claude/skills/auditor-seguranca/scripts/varredura.py /caminho/do/proj
 
 Saída: lista de achados com severidade (CRITICO, ALTO, MEDIO, VERIFICAR), arquivo:linha, problema
 e correção. Código de saída: `2` = crítico (gate reprovado), `1` = alto, `0` = aprovado.
+
+O que a varredura procura:
+
+| Código | Severidade | O que acha |
+|---|---|---|
+| `SEGREDO_NO_CODIGO` | CRITICO/ALTO | chave de provedor ou senha escrita no código |
+| `ENV_COMMITADO`, `ENV_NO_HISTORICO`, `GITIGNORE_SEM_ENV` | CRITICO/ALTO | `.env` no Git, no histórico ou fora do `.gitignore` |
+| `SERVICE_ROLE_NO_FRONTEND` | CRITICO | chave service_role do Supabase em arquivo de frontend |
+| `SEGREDO_EM_VAR_PUBLICA` | CRITICO | `NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, `EXPO_PUBLIC_`, `PUBLIC_` com nome de segredo (SECRET, TOKEN, OPENAI...), no código ou no `.env` |
+| `WEBHOOK_SEM_ASSINATURA` | ALTO | rota de webhook sem sinal de verificação (constructEvent, hottok, HMAC, segredo); comentário não conta como verificação |
+| `SENHA_SEM_HASH` | ALTO | senha do request gravada em arquivo sem bcrypt/argon2/scrypt |
+| `SQL_CONCATENADO` | ALTO | SQL com interpolação, concatenação, f-string, `%` ou `.format` sem placeholder, ou interpolando dado do request |
+| `DEPENDENCIA_VULNERAVEL` | ALTO/MEDIO | `npm audit` com vulnerabilidade crítica/alta (ALTO) ou só moderada (MEDIO) |
+| `DADO_PESSOAL_EM_LOG`, `CPF_NO_CODIGO` | ALTO | dado pessoal em log ou CPF real no código |
+| `HTML_INSEGURO` | MEDIO | `innerHTML` com dado, `dangerouslySetInnerHTML`, `v-html`, `{@html}`, `document.write` |
+| `SEM_RATE_LIMIT` | MEDIO | projeto com rota de servidor e nenhum sinal de rate limit |
+| `CORS_ABERTO` | MEDIO | CORS liberado para `*` |
+| `ADMIN_SEM_SINAL_DE_AUTH`, `SUPABASE_CONFERIR_RLS`, `DEPENDENCIA_NAO_AUDITADA`, `SEM_GIT` | VERIFICAR | onde olhar a mão, ou checagem que não rodou (sem npm, sem lockfile, sem internet) |
 
 ### Passo 2: explicar, do pior pro melhor
 
@@ -124,6 +142,13 @@ Quando o aluno perguntar de LGPD (projetos com dado de cliente, saúde, financei
   Nenhum dos dois é pentest, não testam lógica de autorização, não invadem nada.
 - Heurísticas (`ADMIN_SEM_SINAL_DE_AUTH`, `SUPABASE_CONFERIR_RLS`) são severidade VERIFICAR:
   apontam onde olhar, não provam defeito.
+- `SQL_CONCATENADO`, `HTML_INSEGURO`, `SENHA_SEM_HASH` e `WEBHOOK_SEM_ASSINATURA` olham uma linha ou
+  um arquivo por vez. SQL quebrado em várias linhas, hash feito em outro arquivo ou assinatura
+  conferida num middleware podem dar falso positivo: conferir o trecho antes de mexer.
+- Arquivo de teste (`test/`, `*.test.js`, `test_*.py`) e linha minificada (mais de 400 caracteres)
+  ficam fora de SQL e HTML.
+- `npm audit` precisa de internet e de `package-lock.json`. Sem isso, o achado é
+  `DEPENDENCIA_NAO_AUDITADA` (VERIFICAR), nunca aprovação calada. Python (`pip-audit`) ainda não.
 - Projetos gigantes: a varredura ignora `node_modules`, `dist` e afins; se o aluno vendoriza
   dependência, o que está lá dentro não é varrido.
 
@@ -134,5 +159,7 @@ python3 ~/.claude/skills/auditor-seguranca/tests/test_varredura.py
 ```
 
 Prova o gate nos dois sentidos: a fixture vulnerável (com segredos falsos plantados) tem que sair
-vermelha com os 8 achados esperados, e a fixture limpa tem que sair verde. Se mexer no scanner,
+vermelha com os 15 achados esperados (cada regra nova também prova o caso de falso positivo medido
+em projeto real na fixture limpa), e a fixture limpa tem que sair verde. O `npm audit` roda contra um
+dublê em `tests/duble-npm/`, sem rede. Resultado esperado: 22/22. Se mexer no scanner,
 rode isto antes de confiar nele.

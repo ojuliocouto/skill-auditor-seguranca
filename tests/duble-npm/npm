@@ -1,0 +1,9 @@
+#!/bin/sh
+# duble do npm para os testes: so responde "npm audit --json", sem rede.
+# Projeto com "vulneravel" no package.json devolve 1 critica e 2 altas; o resto, zero.
+[ "$1" = "audit" ] || exit 1
+if grep -q vulneravel package.json 2>/dev/null; then
+  echo '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":2,"critical":1,"total":3}}}'
+  exit 1
+fi
+echo '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}}}'
