@@ -9,6 +9,28 @@ import sys
 AQUI = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(AQUI, "..", "scripts", "varredura.py")
 
+# Chaves falsas montadas em tempo de teste: no repo so ficam os marcadores, assim o
+# audit de segredos do push nao confunde a fixture com vazamento.
+CHAVES_FALSAS = {
+    "__CHAVE_FALSA_OPENAI_1__": "sk-" + "proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0KkLlMmNn",
+    "__CHAVE_FALSA_OPENAI_2__": "sk-" + "proj-Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1Qq0PpOoNnMm",
+    "__JWT_FALSO__": "eyJ" + "hbGciOiJIUzI1NiJ9." + "eyJ" + "yb2xlIjoic2VydmljZV9yb2xlIn0." + "a" * 16,
+}
+
+def planta_chaves_falsas(destino):
+    for raiz, _, arquivos in os.walk(destino):
+        for nome in arquivos:
+            caminho = os.path.join(raiz, nome)
+            try:
+                texto = open(caminho, encoding="utf-8").read()
+            except (UnicodeDecodeError, OSError):
+                continue
+            novo = texto
+            for marcador, valor in CHAVES_FALSAS.items():
+                novo = novo.replace(marcador, valor)
+            if novo != texto:
+                open(caminho, "w", encoding="utf-8").write(novo)
+
 def roda(fixture, path=None):
     """Copia a fixture pra um tmpdir e cria o git ali (fixture versionada nao pode ter .git
     proprio: viraria gitlink e sumiria no clone do repo da skill)."""
@@ -16,6 +38,7 @@ def roda(fixture, path=None):
     with tempfile.TemporaryDirectory() as tmp:
         destino = os.path.join(tmp, fixture)
         shutil.copytree(os.path.join(AQUI, fixture), destino)
+        planta_chaves_falsas(destino)
         g = ["git", "-C", destino, "-c", "user.email=t@t", "-c", "user.name=t"]
         subprocess.run(g + ["init", "-q"], check=True, timeout=60)
         subprocess.run(g + ["add", "-A"], check=True, timeout=60)
